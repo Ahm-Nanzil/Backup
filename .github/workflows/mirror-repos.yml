@@ -1,0 +1,41 @@
+name: Mirror All Repositories from Source to Target
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get install jq -y
+
+      - name: Fetch list of repositories from source account
+        id: fetch_repos
+        run: |
+          curl -s -H "Authorization: token ${{ secrets.SOURCE_GITHUB_TOKEN }}" \
+            https://api.github.com/users/${{ secrets.SOURCE_GITHUB_USERNAME }}/repos?per_page=100 > repos.json
+          echo "REPOS=$(jq -r '.[].name' repos.json | tr '\n' ' ')" >> $GITHUB_ENV
+
+      - name: Clone and push each repository
+        run: |
+          for repo in $REPOS; do
+            echo "Processing $repo..."
+
+            git clone --mirror https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/${{ secrets.SOURCE_GITHUB_USERNAME }}/$repo.git
+            cd $repo.git
+
+            # Create repo in target account if it doesn’t exist
+            curl -s -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo | jq '.message' | grep "Not Found" && \
+            curl -X POST -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
+              -d "{\"name\":\"$repo\", \"private\":false}" \
+              https://api.github.com/user/repos
+
+            # Push to target
+            git push --mirror https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo.git
+
+            cd ..
+            rm -rf $repo.git
+          done
