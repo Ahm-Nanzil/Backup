@@ -2,240 +2,45 @@ name: Mirror All Repositories from Source to Target
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Run in dry-run mode (no actual mirroring)'
-        required: false
-        default: 'false'
-        type: boolean
   schedule:
-    - cron: '30 8 * * *'  # Daily at 8:30 AM UTC
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/mirror-repos.yml'  # Trigger when workflow file changes
+    - cron: '30 8 * * *'  
 
-env:
-  SOURCE_USERNAME: ${{ secrets.SOURCE_GITHUB_USERNAME }}
-  TARGET_USERNAME: ${{ secrets.TARGET_GITHUB_USERNAME }}
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
 
     steps:
-      - name: Validate required secrets
-        run: |
-          echo "Current UTC time: $(date -u)"
-          echo "Workflow triggered by: ${{ github.event_name }}"
-          echo "Repository: ${{ github.repository }}"
-          echo "Branch: ${{ github.ref }}"
-          echo "Cron schedule: 30 8 * * * (8:30 AM UTC daily)"
-        run: |
-          if [[ -z "${{ secrets.SOURCE_GITHUB_TOKEN }}" ]]; then
-            echo "ERROR: SOURCE_GITHUB_TOKEN secret is not set"
-            exit 1
-          fi
-          if [[ -z "${{ secrets.TARGET_GITHUB_TOKEN }}" ]]; then
-            echo "ERROR: TARGET_GITHUB_TOKEN secret is not set"
-            exit 1
-          fi
-          if [[ -z "${{ secrets.SOURCE_GITHUB_USERNAME }}" ]]; then
-            echo "ERROR: SOURCE_GITHUB_USERNAME secret is not set"
-            exit 1
-          fi
-          if [[ -z "${{ secrets.TARGET_GITHUB_USERNAME }}" ]]; then
-            echo "ERROR: TARGET_GITHUB_USERNAME secret is not set"
-            exit 1
-          fi
-
       - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl git
+        run: sudo apt-get install jq -y
 
-      - name: Configure Git
-        run: |
-          git config --global user.name "Repository Mirror Bot"
-          git config --global user.email "mirror-bot@github-actions.local"
-          git config --global init.defaultBranch main
-
-      - name: Fetch repositories from source account
+      - name: Fetch list of repositories from source account
         id: fetch_repos
         run: |
-          echo "Fetching repositories from $SOURCE_USERNAME..."
-          
-          # Initialize variables
-          page=1
-          per_page=100
-          all_repos=()
-          
-          # Fetch all pages of repositories
-          while true; do
-            echo "Fetching page $page..."
-            response=$(curl -s -w "%{http_code}" -H "Authorization: token ${{ secrets.SOURCE_GITHUB_TOKEN }}" \
-              "https://api.github.com/users/$SOURCE_USERNAME/repos?per_page=$per_page&page=$page&sort=updated&direction=desc")
-            
-            http_code="${response: -3}"
-            json_response="${response%???}"
-            
-            if [[ "$http_code" != "200" ]]; then
-              echo "ERROR: Failed to fetch repositories (HTTP $http_code)"
-              echo "$json_response"
-              exit 1
+          curl -s -H "Authorization: token ${{ secrets.SOURCE_GITHUB_TOKEN }}" \
+            https://api.github.com/users/${{ secrets.SOURCE_GITHUB_USERNAME }}/repos?per_page=100 > repos.json
+          echo "REPOS=$(jq -r '.[].name' repos.json | tr '\n' ' ')" >> $GITHUB_ENV
+
+            - name: Clone and push each repository excluding pull request refs
+        run: |
+          for repo in $REPOS; do
+            echo "Processing $repo..."
+
+            # Clone the repo as a bare repository (mirror clone)
+            git clone --bare https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/${{ secrets.SOURCE_GITHUB_USERNAME }}/$repo.git
+            cd $repo.git
+
+            # Create repo in target account if it doesn’t exist
+            if curl -s -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo | jq '.message' | grep -q "Not Found"; then
+              curl -X POST -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
+                -d "{\"name\":\"$repo\", \"private\":false}" \
+                https://api.github.com/user/repos
             fi
-            
-            # Parse repository names from response
-            repos_on_page=$(echo "$json_response" | jq -r '.[].name // empty')
-            
-            if [[ -z "$repos_on_page" ]]; then
-              echo "No more repositories found on page $page"
-              break
-            fi
-            
-            # Add repos to array
-            while IFS= read -r repo; do
-              [[ -n "$repo" ]] && all_repos+=("$repo")
-            done <<< "$repos_on_page"
-            
-            # Check if we got fewer repos than per_page (last page)
-            repo_count=$(echo "$json_response" | jq '. | length')
-            if [[ "$repo_count" -lt "$per_page" ]]; then
-              break
-            fi
-            
-            ((page++))
+
+            # Push all refs except refs/pull/*
+            git for-each-ref --format='%(refname)' refs/heads refs/tags | grep -v '^refs/pull/' | xargs -I {} git push https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo.git {}
+
+            cd ..
+            rm -rf $repo.git
           done
-          
-          echo "Found ${#all_repos[@]} repositories"
-          
-          # Save to file and environment
-          printf '%s\n' "${all_repos[@]}" > repos_list.txt
-          echo "TOTAL_REPOS=${#all_repos[@]}" >> $GITHUB_ENV
-
-      - name: Mirror repositories
-        run: |
-          if [[ ! -f repos_list.txt ]]; then
-            echo "ERROR: No repositories list found"
-            exit 1
-          fi
-          
-          total_repos=$(wc -l < repos_list.txt)
-          current_repo=0
-          successful_mirrors=0
-          failed_mirrors=0
-          
-          echo "Starting to mirror $total_repos repositories..."
-          
-          while IFS= read -r repo; do
-            [[ -z "$repo" ]] && continue
-            
-            ((current_repo++))
-            echo ""
-            echo "[$current_repo/$total_repos] Processing repository: $repo"
-            
-            # Skip if dry run
-            if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
-              echo "DRY RUN: Would mirror $repo"
-              ((successful_mirrors++))
-              continue
-            fi
-            
-            # Create temporary directory for this repo
-            temp_dir="temp_$repo_$$"
-            mkdir -p "$temp_dir"
-            cd "$temp_dir"
-            
-            # Clone source repository
-            echo "Cloning $SOURCE_USERNAME/$repo..."
-            if ! git clone --mirror "https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/$SOURCE_USERNAME/$repo.git" "$repo.git"; then
-              echo "ERROR: Failed to clone $repo"
-              cd ..
-              rm -rf "$temp_dir"
-              ((failed_mirrors++))
-              continue
-            fi
-            
-            cd "$repo.git"
-            
-            # Check if target repository exists
-            echo "Checking if target repository exists..."
-            target_check=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/$TARGET_USERNAME/$repo")
-            
-            if [[ "$target_check" == "404" ]]; then
-              echo "Creating repository $repo in target account..."
-              create_response=$(curl -s -w "%{http_code}" \
-                -X POST \
-                -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
-                -H "Content-Type: application/json" \
-                -d "{\"name\":\"$repo\", \"private\":false, \"description\":\"Mirror of $SOURCE_USERNAME/$repo\"}" \
-                "https://api.github.com/user/repos")
-              
-              create_http_code="${create_response: -3}"
-              create_json="${create_response%???}"
-              
-              if [[ "$create_http_code" != "201" ]]; then
-                echo "ERROR: Failed to create repository $repo (HTTP $create_http_code)"
-                echo "$create_json"
-                cd ../..
-                rm -rf "$temp_dir"
-                ((failed_mirrors++))
-                continue
-              fi
-              
-              echo "Repository $repo created successfully"
-              # Wait a moment for repository to be fully created
-              sleep 2
-            elif [[ "$target_check" == "200" ]]; then
-              echo "Target repository $repo already exists"
-            else
-              echo "ERROR: Unexpected response when checking target repository (HTTP $target_check)"
-              cd ../..
-              rm -rf "$temp_dir"
-              ((failed_mirrors++))
-              continue
-            fi
-            
-            # Push to target repository
-            echo "Pushing to target repository..."
-            if git push --mirror "https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/$TARGET_USERNAME/$repo.git"; then
-              echo "Successfully mirrored $repo"
-              ((successful_mirrors++))
-            else
-              echo "ERROR: Failed to push $repo to target"
-              ((failed_mirrors++))
-            fi
-            
-            # Cleanup
-            cd ../..
-            rm -rf "$temp_dir"
-            
-            # Rate limiting - wait between operations
-            sleep 1
-            
-          done < repos_list.txt
-          
-          echo ""
-          echo "=== MIRROR SUMMARY ==="
-          echo "Total repositories: $total_repos"
-          echo "Successfully mirrored: $successful_mirrors"
-          echo "Failed: $failed_mirrors"
-          
-          # Set job status based on results
-          if [[ "$failed_mirrors" -gt 0 ]]; then
-            echo "Some repositories failed to mirror"
-            exit 1
-          else
-            echo "All repositories mirrored successfully!"
-          fi
-
-      - name: Cleanup
-        if: always()
-        run: |
-          # Clean up any remaining temporary files
-          rm -f repos_list.txt repos.json
-          rm -rf temp_*
