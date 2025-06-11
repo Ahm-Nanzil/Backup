@@ -3,7 +3,7 @@ name: Mirror All Repositories from Source to Target
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20 9 * * *'  # 9:10 AM UTC daily
+    - cron: '35 9 * * *'  # 9:10 AM UTC daily
 
 jobs:
   mirror:
