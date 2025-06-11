@@ -2,6 +2,9 @@ name: Mirror All Repositories from Source to Target
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '20 8 * * *'  
+
 
 jobs:
   mirror:
