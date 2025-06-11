@@ -13,6 +13,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Show UTC time
+        run: date -u
+
       - name: Fetch and mirror repositories
         run: |
           # Fetch repositories
