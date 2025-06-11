@@ -2,8 +2,6 @@ name: Mirror All Repositories from Source to Target
 
 on:
   workflow_dispatch:
-    
-
 
 jobs:
   mirror:
@@ -20,25 +18,23 @@ jobs:
             https://api.github.com/users/${{ secrets.SOURCE_GITHUB_USERNAME }}/repos?per_page=100 > repos.json
           echo "REPOS=$(jq -r '.[].name' repos.json | tr '\n' ' ')" >> $GITHUB_ENV
 
-            - name: Clone and push each repository excluding pull request refs
+      - name: Clone and push each repository excluding pull request refs
         run: |
           for repo in $REPOS; do
             echo "Processing $repo..."
-
-            # Clone the repo as a bare repository (mirror clone)
             git clone --bare https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/${{ secrets.SOURCE_GITHUB_USERNAME }}/$repo.git
             cd $repo.git
 
-            # Create repo in target account if it doesn’t exist
             if curl -s -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
               https://api.github.com/repos/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo | jq '.message' | grep -q "Not Found"; then
               curl -X POST -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
-                -d "{\"name\":\"$repo\", \"private\":false}" \
+                -d "{\"name\":\"$repo\",\"private\":false}" \
                 https://api.github.com/user/repos
             fi
 
-            # Push all refs except refs/pull/*
-            git for-each-ref --format='%(refname)' refs/heads refs/tags | grep -v '^refs/pull/' | xargs -I {} git push https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo.git {}
+            git for-each-ref --format='%(refname)' refs/heads refs/tags \
+              | grep -v '^refs/pull/' \
+              | xargs -I {} git push https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo.git {}
 
             cd ..
             rm -rf $repo.git
