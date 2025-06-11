@@ -3,40 +3,70 @@ name: Mirror All Repositories from Source to Target
 on:
   workflow_dispatch:
   schedule:
-    - cron: '10 9 * * *'  
+    - cron: '20 9 * * *'  # 9:10 AM UTC daily
+
 jobs:
   mirror:
     runs-on: ubuntu-latest
-
+    
     steps:
-      - name: Install dependencies
-        run: sudo apt-get install jq -y
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Fetch list of repositories from source account
-        id: fetch_repos
+      - name: Fetch and mirror repositories
         run: |
+          # Fetch repositories
+          echo "Fetching repositories..."
           curl -s -H "Authorization: token ${{ secrets.SOURCE_GITHUB_TOKEN }}" \
-            https://api.github.com/users/${{ secrets.SOURCE_GITHUB_USERNAME }}/repos?per_page=100 > repos.json
-          echo "REPOS=$(jq -r '.[].name' repos.json | tr '\n' ' ')" >> $GITHUB_ENV
-
-      - name: Clone and push each repository excluding pull request refs
-        run: |
-          for repo in $REPOS; do
-            echo "Processing $repo..."
-            git clone --bare https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/${{ secrets.SOURCE_GITHUB_USERNAME }}/$repo.git
-            cd $repo.git
-
-            if curl -s -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
-              https://api.github.com/repos/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo | jq '.message' | grep -q "Not Found"; then
-              curl -X POST -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
-                -d "{\"name\":\"$repo\",\"private\":false}" \
-                https://api.github.com/user/repos
+            "https://api.github.com/users/${{ secrets.SOURCE_GITHUB_USERNAME }}/repos?per_page=100&type=all" > repos.json
+          
+          # Check if we got repositories
+          repo_count=$(jq length repos.json)
+          echo "Found $repo_count repositories"
+          
+          if [ "$repo_count" -eq 0 ]; then
+            echo "No repositories found. Check SOURCE_GITHUB_USERNAME and SOURCE_GITHUB_TOKEN"
+            exit 1
+          fi
+          
+          # Process each repository
+          jq -r '.[].name' repos.json | while read repo; do
+            if [ -z "$repo" ]; then
+              continue
             fi
-
-            git for-each-ref --format='%(refname)' refs/heads refs/tags \
-              | grep -v '^refs/pull/' \
-              | xargs -I {} git push https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo.git {}
-
+            
+            echo "Processing repository: $repo"
+            
+            # Clone repository
+            if ! git clone --bare "https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/${{ secrets.SOURCE_GITHUB_USERNAME }}/$repo.git"; then
+              echo "Failed to clone $repo, skipping..."
+              continue
+            fi
+            
+            cd "$repo.git"
+            
+            # Check if target repository exists, create if not
+            if ! curl -s -f -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo" > /dev/null; then
+              echo "Creating repository $repo on target account..."
+              curl -X POST -H "Authorization: token ${{ secrets.TARGET_GITHUB_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\":\"$repo\",\"private\":false}" \
+                "https://api.github.com/user/repos"
+              sleep 2  # Give GitHub time to create the repo
+            fi
+            
+            # Push all branches and tags (excluding pull request refs)
+            echo "Pushing branches and tags for $repo..."
+            if ! git push --mirror "https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ secrets.TARGET_GITHUB_USERNAME }}/$repo.git"; then
+              echo "Failed to push $repo"
+            fi
+            
             cd ..
-            rm -rf $repo.git
+            rm -rf "$repo.git"
+            
+            echo "Completed processing $repo"
+            echo "---"
           done
+          
+          echo "Mirror operation completed"
